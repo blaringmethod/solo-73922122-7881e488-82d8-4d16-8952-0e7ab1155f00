@@ -19,6 +19,44 @@
   {% endfor %}
 {% endwith %}
 
+{% if event_rows %}
+<!-- 最近一次补签的核定变动（按批号/转料记录号列出前后公斤数） -->
+<section class="card highlight-card">
+  <h2>★ 本次补签的核定重量变动
+    <span class="tag">审核员逐笔核对用 · 整数公斤</span>
+  </h2>
+  {% if event_rows|length == 1 and event_rows[0].skipped %}
+    <div class="solution-box">
+      <strong>该批现行核定重量已达到申请下限：只登记了签单，跳过求解。</strong><br>
+      所有出货批与转料的核定重量均未改动，行级明细的更新时间保持原值。
+    </div>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>类型</th><th>批号 / 转料记录号</th><th class="num">变动前(kg)</th>
+      <th class="num">变动后(kg)</th><th class="num">增减(kg)</th></tr>
+    </thead>
+    <tbody>
+    {% for r in event_rows %}
+      <tr class="changed-row">
+        <td>{% if r.target_type == 'batch' %}出货批{% else %}转料{% endif %}</td>
+        <td class="code">{{ r.target_ref }}</td>
+        <td class="num">{{ r.before_kg }}</td>
+        <td class="num"><strong>{{ r.after_kg }}</strong></td>
+        <td class="num {{ 'up' if r.change_kg > 0 else 'down' }}">
+          {{ '%+d'|format(r.change_kg) }}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="small muted">仅重量有变的核定明细行被写入；未列出的行保持签发前的核定值不变。</p>
+  {% endif %}
+</section>
+{% endif %}
+
 <!-- 1. 账套上传 -->
 <section class="card">
   <h2>① 上传称重账 CSV
@@ -132,8 +170,9 @@
     <tbody>
     {% for b in batches %}
       {% set c = cert_map.get(b.code) %}
-      {% set v = sol_batch_map.get(b.code) %}
-      <tr>
+      {% set v = display_batch_map.get(b.code) %}
+      {% set ev = event_map.get(('batch', b.code)) %}
+      <tr {{ 'class=changed-row' if ev else '' }}>
         <td class="code">{{ b.code }}</td>
         <td class="code">{{ b.furnace_code }}</td>
         <td class="num">{{ b.weight_kg }}</td>
@@ -141,6 +180,9 @@
         <td class="num">
           {% if v is not none %}
             <strong>{{ v }}</strong>
+            {% if ev %}
+              <span class="delta up" title="补签变动">（{{ ev.before_kg }}→{{ ev.after_kg }}，{{ '%+d'|format(ev.change_kg) }}）</span>
+            {% endif %}
             {% if c and v < c.min_recycled_kg %}<span class="balance-bad">低于签单!</span>{% endif %}
           {% else %}<span class="muted">待核定</span>{% endif %}
         </td>
@@ -157,7 +199,7 @@
               <input type="hidden" name="batch_code" value="{{ b.code }}">
               <input type="number" name="min_recycled_kg" min="1" max="{{ b.weight_kg }}"
                      step="1" placeholder="最低kg" required>
-              <button type="submit">签发申报</button>
+              <button type="submit">补签申报</button>
             </form>
           {% endif %}
         </td>
@@ -166,7 +208,7 @@
     </tbody>
   </table>
   </div>
-  <p class="small muted">规则：每批最多一张有效签单；下限须为不超过实称重量的正整数；签发即触发整体重核，无解则自动回滚。</p>
+  <p class="small muted">规则：每批最多一张有效签单；下限须为不超过实称重量的正整数。补签时若该批现行核定已达下限则只登记签单、跳过求解；否则以签发前核定值为基准做最小变动重核，仅写入有变的行，无解或写入失败则整笔回滚。</p>
 </section>
 
 <!-- 5. 余料转料 -->
@@ -185,13 +227,21 @@
     </thead>
     <tbody>
     {% for t in transfers %}
-      {% set v = sol_transfer_map.get(t.id) %}
-      <tr>
+      {% set v = display_transfer_map.get(t.id) %}
+      {% set ev = event_map.get(('transfer', t.id|string)) %}
+      <tr {{ 'class=changed-row' if ev else '' }}>
         <td class="num muted">{{ t.id }}</td>
         <td class="code">{{ t.src_furnace }}</td>
         <td class="code">→ {{ t.dst_furnace }}</td>
         <td class="num">{{ t.weight_kg }}</td>
-        <td class="num">{% if v is not none %}<strong>{{ v }}</strong>{% else %}<span class="muted">待核定</span>{% endif %}</td>
+        <td class="num">
+          {% if v is not none %}
+            <strong>{{ v }}</strong>
+            {% if ev %}
+              <span class="delta down" title="补签变动">（{{ ev.before_kg }}→{{ ev.after_kg }}，{{ '%+d'|format(ev.change_kg) }}）</span>
+            {% endif %}
+          {% else %}<span class="muted">待核定</span>{% endif %}
+        </td>
       </tr>
     {% else %}
       <tr><td colspan="5" class="muted">本账套无余料转料记录。</td></tr>
@@ -232,9 +282,40 @@
 </section>
 {% endif %}
 
-<!-- 7. 审计日志 -->
+<!-- 7. 补签变动台账 -->
 <section class="card">
-  <h2>⑦ 最近操作日志</h2>
+  <h2>⑦ 补签变动台账（最近 30 行，全部留痕）</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>时间(UTC)</th><th>签单#</th><th>类型</th><th>批号/记录号</th>
+    <th class="num">变动前(kg)</th><th class="num">变动后(kg)</th><th class="num">增减(kg)</th><th>结果</th></tr></thead>
+    <tbody>
+    {% for r in recent_changes %}
+      <tr>
+        <td class="small">{{ r.created_at }}</td>
+        <td class="num">{% if r.cert_id %}{{ r.cert_id }}{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td>{% if r.skipped %}事件{% elif r.target_type == 'batch' %}出货批{% else %}转料{% endif %}</td>
+        <td class="code">{{ r.target_ref }}</td>
+        {% if r.skipped %}
+          <td class="num muted" colspan="3">只登记签单，跳过求解，核定重量无变动</td>
+        {% else %}
+          <td class="num">{{ r.before_kg }}</td>
+          <td class="num"><strong>{{ r.after_kg }}</strong></td>
+          <td class="num {{ 'up' if r.change_kg > 0 else 'down' }}">{{ '%+d'|format(r.change_kg) }}</td>
+        {% endif %}
+        <td><span class="log-ok">已写入</span></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="muted">暂无补签变动记录。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- 8. 审计日志 -->
+<section class="card">
+  <h2>⑧ 最近操作日志</h2>
   <div class="table-wrap">
   <table>
     <thead><tr><th>时间(UTC)</th><th>动作</th><th>明细</th><th>结果</th></tr></thead>

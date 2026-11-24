@@ -16,7 +16,7 @@ from flask import (
 from . import csvutil, db
 from .solver import (
     CertRequirement, FurnaceBatchLink, FurnaceInput, SolveError, TransferInput,
-    solve_allocation,
+    solve_allocation, solve_min_change,
 )
 
 
@@ -26,8 +26,13 @@ def create_app() -> Flask:
     app.config["SECRET_KEY"] = os.environ.get("AUDIT_SECRET_KEY", "dev-audit-secret")
 
     conn = db.get_conn()
-    db.init_db(conn)
-    conn.close()
+    try:
+        db.init_db(conn)
+        # 已有账套：把旧版核定快照一次性迁移到行级明细表（幂等）
+        with db.transaction(conn):
+            db.migrate_solution_lines(conn)
+    finally:
+        conn.close()
 
     # ------------------------------------------------------------------
     def _build_solver_inputs(conn, ledger_id):
@@ -51,12 +56,17 @@ def create_app() -> Flask:
         return f_inputs, links, t_inputs, reqs
 
     def _run_and_persist(conn, ledger_id: int) -> Tuple[bool, Optional[str]]:
-        """在当前事务内求解并覆盖保存该账套核定结果。"""
+        """在当前事务内求解并覆盖保存该账套核定结果（快照表 + 行级明细表）。"""
         f_inputs, links, t_inputs, reqs = _build_solver_inputs(conn, ledger_id)
         result = solve_allocation(f_inputs, links, t_inputs, reqs)
         if result.ok:
             db.save_solution(
                 conn, ledger_id, True, None,
+                batch_values=result.batch_recycled.items(),
+                transfer_values=result.transfer_recycled.items(),
+            )
+            db.save_solution_lines_full(
+                conn, ledger_id,
                 batch_values=result.batch_recycled.items(),
                 transfer_values=result.transfer_recycled.items(),
             )
@@ -90,6 +100,9 @@ def create_app() -> Flask:
             sol_row = None
             sol_batches = sol_transfers = []
             ledger_row = None
+            line_batch_map = {}
+            line_transfer_map = {}
+            event_rows = []
             if view_ledger_id:
                 ledger_row = conn.execute(
                     "SELECT * FROM ledgers WHERE id = ?", (view_ledger_id,)
@@ -101,6 +114,25 @@ def create_app() -> Flask:
                         sol_batches, sol_transfers = db.solution_details(
                             conn, sol_row["id"]
                         )
+                    # 行级核定明细（补签只更新有变的行；页面以它为准展示）
+                    lb_rows = conn.execute(
+                        "SELECT * FROM solution_batch_lines WHERE ledger_id = ?",
+                        (view_ledger_id,),
+                    ).fetchall()
+                    line_batch_map = {r["batch_code"]: r["recycled_kg"] for r in lb_rows}
+                    lt_rows = conn.execute(
+                        "SELECT * FROM solution_transfer_lines WHERE ledger_id = ?",
+                        (view_ledger_id,),
+                    ).fetchall()
+                    line_transfer_map = {r["transfer_id"]: r["recycled_kg"] for r in lt_rows}
+                    # 指定的补签事件（从签发后回跳的 event 参数取）
+                    event_id = request.args.get("event", type=int)
+                    if event_id:
+                        event_rows = [
+                            r for r in db.sign_changes_since(conn, event_id)
+                            if r["ledger_id"] == view_ledger_id
+                        ]
+            recent_changes = db.recent_sign_changes(conn)
             certs = conn.execute(
                 "SELECT * FROM certificates ORDER BY active DESC, signed_at DESC, id DESC"
             ).fetchall()
@@ -111,6 +143,15 @@ def create_app() -> Flask:
             cert_map = {c["batch_code"]: c for c in certs if c["active"]}
             sol_batch_map = {r["batch_code"]: r["recycled_kg"] for r in sol_batches}
             sol_transfer_map = {r["transfer_id"]: r["recycled_kg"] for r in sol_transfers}
+            # 行级表优先（补签后的权威值）；旧快照表兜底
+            display_batch_map = dict(sol_batch_map)
+            display_batch_map.update(line_batch_map)
+            display_transfer_map = dict(sol_transfer_map)
+            display_transfer_map.update(line_transfer_map)
+            # 本次补签事件按行号索引，模板高亮变动前后公斤数
+            event_map = {
+                (r["target_type"], r["target_ref"]): r for r in event_rows
+            }
 
             # 每炉物料平衡（账套原值，供页面核对“总进料=总出料”）
             balance = {}
@@ -144,6 +185,11 @@ def create_app() -> Flask:
                 sol_row=sol_row,
                 sol_batch_map=sol_batch_map,
                 sol_transfer_map=sol_transfer_map,
+                display_batch_map=display_batch_map,
+                display_transfer_map=display_transfer_map,
+                event_rows=event_rows,
+                event_map=event_map,
+                recent_changes=recent_changes,
                 logs=logs,
             )
         finally:
@@ -208,6 +254,11 @@ def create_app() -> Flask:
                     batch_values=result.batch_recycled.items(),
                     transfer_values=result.transfer_recycled.items(),
                 )
+                db.save_solution_lines_full(
+                    conn, new_id,
+                    batch_values=result.batch_recycled.items(),
+                    transfer_values=result.transfer_recycled.items(),
+                )
                 db.log_event(
                     conn, "upload",
                     f"导入 {file.filename}（账套#{new_id}）并核定成功", True,
@@ -232,6 +283,13 @@ def create_app() -> Flask:
     # ------------------------------------------------------------------
     @app.route("/certificates/sign", methods=["POST"])
     def sign_cert():
+        """单批补签。
+
+        1) 该批现行核定重量已达申请下限：只登记签单，跳过求解；
+        2) 否则以签发前核定值为基准，做最小变动重核（改变量绝对值之和最小），
+           仅把重量有变的核定明细行写入；无解或写入失败整笔回滚，
+           原签单与核定结果全部保留。
+        """
         batch = (request.form.get("batch_code") or "").strip()
         raw_min = (request.form.get("min_recycled_kg") or "").strip()
         if not batch:
@@ -269,20 +327,90 @@ def create_app() -> Flask:
                         f"批 {batch} 实称仅 {row['weight_kg']} kg，"
                         f"不能签发高于实称重量的最低再生料 {min_kg} kg。"
                     )
-                conn.execute(
+
+                # 签发前的核定基准（行级明细表；老库启动时已自动迁移）
+                base_b, base_t = db.baseline_lines(conn, cur_lid)
+                if batch not in base_b:
+                    raise CsvConflict(
+                        "缺少该批的签发前核定基准，请先执行一次“重新核定”后再补签。"
+                    )
+
+                cur_cert = conn.execute(
                     "INSERT INTO certificates(batch_code, min_recycled_kg, active, signed_at) "
                     "VALUES (?, ?, 1, ?)",
                     (batch, min_kg, db.utcnow_iso()),
                 )
-                ok, reason = _run_and_persist(conn, cur_lid)
-                if not ok:
-                    raise CsvConflict(reason or "加入该签单后无可行解。")
-                db.log_event(conn, "sign", f"批 {batch} 签发最低再生料 {min_kg} kg", True)
-            flash(f"已为批 {batch} 签发最低再生料 {min_kg} kg，并重新核定成功。", "ok")
-            return redirect(url_for("index", ledger=cur_lid))
+                cert_id = cur_cert.lastrowid
+
+                baseline_value = base_b[batch]
+                if baseline_value >= min_kg:
+                    # 现行核定重量已达申请下限：只登记签单，跳过求解
+                    db.record_sign_changes(conn, cert_id, cur_lid, [], skipped=True)
+                    event_id = db.latest_sign_event_id(conn)
+                    db.log_event(
+                        conn, "sign",
+                        f"批 {batch} 补签下限 {min_kg} kg：现行核定 {baseline_value} kg "
+                        f"已达下限，仅登记签单、跳过求解",
+                        True,
+                    )
+                    flash(
+                        f"批 {batch} 补签 {min_kg} kg：现行核定 {baseline_value} kg "
+                        f"已达到申请下限，仅登记签单，未触发重核、核定重量无任何变动。",
+                        "ok",
+                    )
+                    return redirect(url_for("index", ledger=cur_lid, event=event_id))
+
+                # 以签发前核定值为基准的最小变动求解
+                f_inputs, links, t_inputs, reqs = _build_solver_inputs(conn, cur_lid)
+                result = solve_min_change(
+                    f_inputs, links, t_inputs, reqs,
+                    baseline_batches=base_b, baseline_transfers=base_t,
+                )
+                if not result.ok:
+                    raise CsvConflict(result.reason or "加入该签单后无可行解。")
+
+                # 快照表整版覆盖（保留历史兼容）；行级明细仅 UPDATE 有变的行
+                db.save_solution(
+                    conn, cur_lid, True, None,
+                    batch_values=result.batch_recycled.items(),
+                    transfer_values=result.transfer_recycled.items(),
+                )
+                changes = db.apply_min_change_lines(
+                    conn, cur_lid,
+                    new_batches=result.batch_recycled,
+                    new_transfers=result.transfer_recycled,
+                    baseline_batches=base_b,
+                    baseline_transfers=base_t,
+                )
+                db.record_sign_changes(conn, cert_id, cur_lid, changes, skipped=False)
+                event_id = db.latest_sign_event_id(conn)
+
+                parts = [
+                    f"{c['target_ref']}：{c['before_kg']}→{c['after_kg']} kg"
+                    f"（{c['change_kg']:+d}）"
+                    for c in changes
+                ]
+                db.log_event(
+                    conn, "sign",
+                    f"批 {batch} 补签下限 {min_kg} kg，最小变动重核成功"
+                    f"（改变量绝对值合计 {result.total_change} kg，"
+                    f"{len(changes)} 行变动）：" + "；".join(parts),
+                    True,
+                )
+            flash(
+                f"批 {batch} 补签 {min_kg} kg 已登记，按最小变动重核成功："
+                f"共 {len(changes)} 笔核定明细变动，改变量绝对值合计 "
+                f"{result.total_change} kg。变动：" + "；".join(parts),
+                "ok",
+            )
+            return redirect(url_for("index", ledger=cur_lid, event=event_id))
         except CsvConflict as exc:
             flash(f"签发失败，签单与核定结果保持原状：{exc}", "error")
             _log_failure("sign", f"批 {batch} 申请 {min_kg} kg 被拒（回滚）：{exc}")
+            return redirect(url_for("index"))
+        except SolveError as exc:
+            flash(f"签发失败，数据未改动：{exc}", "error")
+            _log_failure("sign", f"批 {batch} 申请 {min_kg} kg 求解异常（回滚）：{exc}")
             return redirect(url_for("index"))
         finally:
             conn.close()

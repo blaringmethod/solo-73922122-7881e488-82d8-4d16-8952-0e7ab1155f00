@@ -104,3 +104,10 @@ label.check { display: inline-flex; gap: 6px; align-items: center; color: var(--
 .log-detail { white-space: normal; }
 .log-ok { color: var(--green); font-weight: 600; }
 .log-fail { color: var(--red); font-weight: 600; }
+.highlight-card { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue) inset; }
+tr.changed-row td { background: #fff8e1 !important; }
+.delta { font-size: 12px; font-weight: 600; }
+.delta.up { color: var(--blue); }
+.delta.down { color: var(--amber); }
+td.up { color: var(--blue); font-weight: 700; }
+td.down { color: var(--amber); font-weight: 700; }
